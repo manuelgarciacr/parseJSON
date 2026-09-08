@@ -4,24 +4,34 @@ set -o nounset
 shopt -s lastpipe
 
 # Definir la limpieza al salir (EXIT) o recibir señales de interrupción (INT, TERM)
-trap 'rm -f "$tmp"' EXIT INT TERM
-tmp=$(mktemp)
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 
 usage() {
     cat <<EOF
 Usage: $0 [options] <fileToParse>
 
 <fileToParse>: It must be a JSON file.
-If no instructions are declared, the file is parsed and tabulated on the screen.
+If parser instructions are declared, data is retrieved in csv format.
 
 options:
-  --debug                      Debug. Future use
+  --debug                      Debug
   --delimiter="|", -d          Delimiter for the output CSV file. Default '|'
+  --file="outputFile", -f      Output file name. The program adds the .csv, .log and .txt.log 
+                                   extensions. 
+                                   If the files already exist adds .new before the extension. 
+                                   Only errors are sent to the screen using the standard error 
+								   flow								      
   --help, -h                   Show command line options
-  --metadata-delimiter="0x1F"  Delimiter for the internal metadata. Must be one caracter length. Default 0x1F
+  --metadata-delimiter="0x1F"  Delimiter for the internal metadata. Must be one caracter 
+                                   length. Default 0x1F
+  --no-header                  Output data wihout headers
   --parseDNSDumpster           Instructions for parse a DNSDumpster JSON file
   --tab="  ", -t               String for tabulated output. By default two spaces
   --verbose, -v			       Verbose
+  --version, -V                Version
 
 Examples:
   $0 -d "||" --parseDNSDumpster -v fileToParse.json 
@@ -35,10 +45,14 @@ DEBUG=0
 DELIMITER_IS_SET=0; # Delimiter can be empty. Overrides parser value
 DELIMITER=""
 DOTOOL="xdotool"
+FDS_RESTORED=1
 FILE=""
 METADATA=""
 PARM_METADATA_DELIMITER="0x1F"
 METADATA_DELIMITER=$(echo "${PARM_METADATA_DELIMITER:2}" | xxd -r -p)
+NO_HEADER=0
+OUTPUT_FILE_IS_SET=0; # If set, it can not be empty
+OUTPUT_FILE=""
 OUTPUT=""
 OUTPUT_HEADER=""
 PARSER=""
@@ -48,11 +62,14 @@ PARSER_LEVEL=0
 PARSER_STOP=0 ## ELIMINAR CUANDO DEJE DE USARLA
 TAB="  "
 TEST="";
+tmp=$(mktemp)
+TMP_CLOSED=0
 VERBOSE=0
+VERSION="01.01"
 
 ARGS=$(LC_ALL=C getopt \
-	--long debug,delimiter:,help,metadata-delimiter:,parseDNSDumpster,tab:,verbose \
-	-o d:ht:v \
+	--long debug,delimiter:,file:help,metadata-delimiter:,no-header,parseDNSDumpster,tab:,verbose,version \
+	-o d:f:ht:vV \
 	-n "$0" \
 	-- "$@" \
 	2>"$tmp"
@@ -106,6 +123,11 @@ args() {
 				DELIMITER_IS_SET=1 
 		        shift
 		        ;;
+			--file|-f)
+				OUTPUT_FILE="$2"
+				OUTPUT_FILE_IS_SET=1
+				shift
+				;;
 		    --help|-h)
 		        usage
 		        [[ -z $TEST ]] && exit 0 || return 0
@@ -113,6 +135,9 @@ args() {
 			--metadata-delimiter)
 				PARM_METADATA_DELIMITER="$2"
 				shift
+				;;
+			--no-header)
+				NO_HEADER=1
 				;;
 		    --parseDNSDumpster)
 				if [ -n "$PARSER" ]; then
@@ -127,6 +152,10 @@ args() {
 			--verbose|-v)
 				VERBOSE=1
 				;;
+			--version|-V)
+				echo "parseJSON v$VERSION"
+		        [[ -z $TEST ]] && exit 0 || return 0
+		        ;;
 		    --)
 		        shift
 		    	if [ "$#" -eq 0 ]; then
@@ -145,10 +174,6 @@ args() {
 		esac
 		shift
 	done
-
-	# if [[ -z $DELIMITER ]]; then
-	# 	error 6 # Empty delimiter
-	# fi
 
 	if [[ "$DELIMITER" =~ ^0[xX] ]]; then
 		local new=$(echo "${DELIMITER:2}" | xxd -r -p)
@@ -181,6 +206,18 @@ args() {
 	if [[ "${#METADATA_DELIMITER}" -ne 1 ]]; then
 		error 12 # Metadata delimiter must be one caracter length: $PARM_METADATA_DELIMITER
 	fi
+
+	if [[ $OUTPUT_FILE_IS_SET -eq 1 && -z $OUTPUT_FILE ]]; then
+		error 14 # Output file parameter cannot be empty
+	fi
+
+	if [[ -n $OUTPUT_FILE ]]; then
+		while [[ -f ${OUTPUT_FILE}.cvs || -f ${OUTPUT_FILE}.log || -f ${OUTPUT_FILE}.txt.log ]]; do
+			OUTPUT_FILE+=".new"
+		done
+	fi
+
+	[[ $DEBUG -eq 1 ]] && VERBOSE=0
 }
 
 ###############################################################################################################
@@ -193,6 +230,17 @@ iterate_file() {
 	local lineNum=0
 	local fathers=()
 
+	if [[ $OUTPUT_FILE_IS_SET -eq 1 || -n $PARSER && $VERBOSE -eq 0 ]]; then
+		exec 8>&1
+		if [[ -z $PARSER || -n $PARSER && $VERBOSE -eq 1 ]]; then
+			exec 7>"${OUTPUT_FILE}.log"
+		else
+			exec 7>/dev/null
+		fi
+		exec 1>&7
+		FDS_RESTORED=0
+	fi
+
     case "$type" in
     	object)
     		iterate_file_object
@@ -203,6 +251,9 @@ iterate_file() {
     	*)
     		cat "$FILE"
     esac
+
+	restore_fds	
+	[[ -f ${OUTPUT_FILE}.log ]]	&& cat "${OUTPUT_FILE}.log" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' > "${OUTPUT_FILE}.txt.log"
 }
 
 iterate_file_object() {
@@ -237,7 +288,7 @@ iterate() {
 	local levelMeta="$1"
 	local tagMeta="$2"
 	local typeMeta="$3"
-	local value="$4"
+	local valueMeta="$4"
 	local del="$DELIMITER"
 	local ctrl="$METADATA_DELIMITER"
 	local tab=$(tab "$levelMeta")
@@ -250,17 +301,14 @@ iterate() {
 
     case "$type" in
     	object)
-		    #print "${tab}$tagMeta:" "$typeMeta"
 			parse_stack
-    		iterate_object "$value" "$levelMeta"
+    		iterate_object "$valueMeta" "$levelMeta"
     		;;
     	array)
-		    #print "${tab}$tagMeta:" "$typeMeta"
 			parse_stack
-    		iterate_array "$value" "$levelMeta"
+    		iterate_array "$valueMeta" "$levelMeta"
     		;;
     	*)
-		    #print "${tab}$tagMeta:" "$value"
 			parse_stack
     esac
 }
@@ -303,10 +351,6 @@ normalizeQuotes() {
 	echo "$@" | sed -e 's/^"\\"/"/' -e 's/\\""$/"/'
 }
 
-print() {
-    if [[ "$VERBOSE" -eq 1 || -z "$PARSER" ]]; then echo "$1 $2"; fi
-}
-
 ###############################################################################################################
 ################                
 ################                                    PARSE FILE
@@ -326,6 +370,17 @@ parse_file() {
 			parser="parserDNSDumpster"
 			;;
 	esac
+
+	if [[ $DEBUG -eq 0 || $OUTPUT_FILE_IS_SET -eq 1 ]]; then
+		exec 8>&1
+		if [[ $DEBUG -eq 1 ]]; then
+			exec 7>"${OUTPUT_FILE}.log"
+		else
+			exec 7>/dev/null
+		fi
+		exec 1>&7
+		FDS_RESTORED=0
+	fi
 
 	data=$($parser)
 	while IFS= read -r line; do
@@ -347,21 +402,17 @@ parse_file() {
 				PARSER_FIELDS+=("${instruction[0]}")
 				;;
 			*)
-				sleep 0
-				# parse_new
+				erro 55 "$PARSER" "${instruction[0]}" # Unknown parser instrucion
 				;;
 		esac
 	done <<< "$data"
 
-
-	if [[ $DEBUG -eq 1 ]]; then
 	echo
 	echo "######################################################################################################"
 	echo "########"
 	echo "########                                         PARSE $PARSER"
 	echo "########"
 	echo
-	fi
 
 	while IFS= read -r line; do
     	[[ -z "$line" ]] && continue
@@ -372,20 +423,13 @@ parse_file() {
 		local typeMeta="${fields[2]}"
 		local valueMeta="${fields[3]}"
 
-		# if [[ -n $DELIMITER && "$tagMeta$valueMeta" == *"$DELIMITER"* ]]; then
-		# 	error 50 # The source data includes the delimiter, use another		
-		# fi
-
-		[[ $VERBOSE -eq 1 ]] && local debug="$DEBUG" && DEBUG=1
 		parse_stack # "$levelMeta" "$tagMeta" "$typeMeta" "$valueMeta"
-		[[ $VERBOSE -eq 1 ]] && DEBUG="$debug"
 
 		parseMetadata
 	done <<< "$METADATA"
 
 	mountLine
 		
-	if [[ $DEBUG -eq 1 ]]; then
 	echo
 	echo "######################################################################################################"
 	echo "########"
@@ -394,9 +438,7 @@ parse_file() {
 	echo
 
 	echo "$INITIAL_METADATA"
-	fi
 
-	if [[ $DEBUG -eq 1 ]]; then
 	echo
 	echo "######################################################################################################"
 	echo "########"
@@ -405,29 +447,27 @@ parse_file() {
 	echo
 
 	echo "$METADATA"
-	fi
 
-	if [[ $DEBUG -eq 1 ]]; then
-	echo
-	echo "######################################################################################################"
-	echo "########"
-	echo "########                                         OUTPUT DATA"
-	echo "########"
-	echo
+	restore_fds	
+	[[ -f ${OUTPUT_FILE}.log ]]	&& cat "${OUTPUT_FILE}.log" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' > "${OUTPUT_FILE}.txt.log"
+
+	if [[ -n $OUTPUT_FILE ]]; then
+		if [[ $NO_HEADER -eq 0 ]] && ! echo "$OUTPUT_HEADER" > "$OUTPUT_FILE.csv"; then
+			error 54 ".csv" # Cannot write on the output file
+		fi
+		if ! echo "$OUTPUT" >> "$OUTPUT_FILE.csv"; then
+			error 54 ".csv" # Cannot write on the output file
+		fi
 	else
-		echo
+		[[ $NO_HEADER -eq 0 ]] && echo "$OUTPUT_HEADER"
+		echo "$OUTPUT"
 	fi
-
-	echo "$OUTPUT_HEADER"
-	echo "$OUTPUT"
 }
 
 parse_delimiter() {
 	defaultDelimiter=$(echo "$1" | sed 's/^"//; s/"$//;')
 
 	[[ $DELIMITER_IS_SET -eq 0 ]] && DELIMITER="$defaultDelimiter"
-
-	[[ $DEBUG -eq 0 ]] && return
 
 	echo
 	echo "######################################################################################################"
@@ -449,8 +489,6 @@ parse_header() {
 
 	OUTPUT_HEADER=$(echo "$@" | sed 's/^"//; s/"$//;' | sed -e "s/$defaultDelimiter/$DELIMITER/g")
 	
-	[[ $DEBUG -eq 0 ]] && return
-
 	echo
 	echo "######################################################################################################"
 	echo "########"
@@ -470,14 +508,12 @@ parse_metadata() {
 	local newData=""
 	local tmpBlock=""
 
-	if [[ $DEBUG -eq 1 ]]; then
 	echo
 	echo "######################################################################################################"
 	echo "########"
 	echo "########                                         ${instruction[@]}"
 	echo "########"
 	echo
-	fi
 
 	INITIAL_METADATA="$METADATA"
 
@@ -509,8 +545,12 @@ parse_stack() {
 	local strLine="0000${lineNum}"
 	local tab=$(tab "$levelMeta")
 	local lastLevel=$(( ${#fathers[@]} - 1 ))
+	local val=""
 
-	[[ -z $PARSER || $DEBUG -eq 1 ]] && echo "${strLine:(-4)}" "$tab$tagMeta: $typeMeta"
+	[[ $typeMeta != "object" && $typeMeta != "array" ]] && val="$valueMeta"
+	[[ ${#val} -gt 20 ]] && val="${val:0:20}..." 
+
+	echo "${strLine:(-4)}" "$tab$tagMeta: $typeMeta $val"
 	
 	if [[ "$levelMeta" -gt "$lastLevel" ]]; then
 		fathers+=("$tagMeta")
@@ -526,7 +566,7 @@ parse_stack() {
 		fathers["$lastLevel"]="$tagMeta"
 	fi	
 
-	[[ -z $PARSER || $DEBUG -eq 1 ]] && gray "${fathers[@]}"
+	gray "${fathers[@]}"
 }
 
 parse_action() {
@@ -540,25 +580,20 @@ parse_action() {
 
 	for meta in "${metadata[@]}"; do
 		(( i++ ))
-		[[ $i -ge ${#fathers[@]} && -n $blockFirstLine && -z $blockLastLine && $DEBUG -eq 1 ]] && echo "###############################################  blockLastLine  # $lineNum"
-		[[ $i -ge ${#fathers[@]} && -n $blockFirstLine && -z $blockLastLine ]] && blockFirstLine=""
-		[[ $i -ge ${#fathers[@]} && -n $fatherFirstLine && -z $fatherLastLine && $DEBUG -eq 1 ]] && echo "###############################################  fatherLastLine  # $lineNum"
-		[[ $i -ge ${#fathers[@]} && -n $fatherFirstLine && -z $fatherLastLine ]] && fatherFirstLine=""
+		[[ $i -ge ${#fathers[@]} && -n $blockFirstLine && -z $blockLastLine ]] && blockFirstLine="" && echo "###############################################  blockLastLine  # $lineNum"
+		[[ $i -ge ${#fathers[@]} && -n $fatherFirstLine && -z $fatherLastLine ]] && fatherFirstLine="" && echo "###############################################  fatherLastLine  # $lineNum"
 		[[ $i -ge ${#fathers[@]} ]] && performAction && return
-		[[ $i -eq $level && -z $fatherFirstLine && $DEBUG -eq 1 ]] && echo "###############################################  fatherFirstLine  # $lineNum"
-		[[ $i -eq $level && -z $fatherFirstLine ]] && fatherFirstLine="$lineNum"
+		[[ $i -eq $level && -z $fatherFirstLine ]] && fatherFirstLine="$lineNum" && echo "###############################################  fatherFirstLine  # $lineNum"
 		[[ "$meta" == '"@"' && "${fathers[i]}" ]] && continue
 		[[ "$meta" == '@' && "${fathers[i]}" =~ ^[0-9]+$ ]] && continue
 		[[ "$meta" == "${fathers[i]}" ]] && continue
 		
-		[[ -n $blockFirstLine && -z $blockLastLine && $DEBUG -eq 1 ]] && echo "###############################################  blockLastLine  # $lineNum"
-		[[ -n $blockFirstLine && -z $blockLastLine ]] && blockFirstLine=""
+		[[ -n $blockFirstLine && -z $blockLastLine ]] && blockFirstLine="" && echo "###############################################  blockLastLine  # $lineNum"
 		performAction
 		return
 	done
 
-	[[ -z $blockFirstLine && $DEBUG -eq 1 ]] && echo "###############################################  blockFirstLine  # $lineNum"
-	[[ -z $blockFirstLine ]] && blockFirstLine="$lineNum"
+	[[ -z $blockFirstLine ]] && blockFirstLine="$lineNum" && echo "###############################################  blockFirstLine  # $lineNum"
 	performAction
 }
 
@@ -684,7 +719,7 @@ parseMetaSearch01() {
 	set -o nounset
 
 	parseMetaMount
-	[[ "$DEBUG" -eq 1 ]] && echo "###############################################  finded  # $lineNum"
+	echo "###############################################  finded  # $lineNum"
 }
 
 parseMetaMount(){
@@ -824,6 +859,9 @@ error() {
 		"13")
 			MSG="Only one parser must be selected. '$PARSER' has already been selected"
 			;;
+		"14")
+			MSG="Output file parameter cannot be empty"
+			;;
 
 
 		"50")
@@ -839,6 +877,12 @@ error() {
 			;;
 		"53")
 			MSG="The output header includes the delimiter '$DELIMITER', use another (ex. --delimiter=\"\$DELIMITER\$DELIMITER\")"
+			;;
+		"54")
+			MSG="Cannot write to output file: '$OUTPUT_FILE$2'"
+			;;
+		"55")
+			MSG="Unknown parser instruction. Parser: '$2', instruction: '$3'"
 			;;
 		*)
 			MSG="$2"
@@ -872,6 +916,28 @@ red() {
 
 yellow() {
 	echo -e "\e[1;33m$@\e[0m"
+}
+
+cleanup() {
+    close_tmp
+    restore_fds
+}
+
+close_tmp() {
+    [[ $TMP_CLOSED -eq 1 ]] && return
+
+    rm -f -- "$tmp"
+    TMP_CLOSED=1
+}
+
+restore_fds() {
+    [[ $FDS_RESTORED -eq 1 ]] && return
+
+    exec 1>&8
+    exec 7>&-
+    exec 8>&-
+
+    FDS_RESTORED=1
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
